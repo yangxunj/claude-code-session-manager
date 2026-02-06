@@ -1,3 +1,5 @@
+**English** | [中文](README_zh.md)
+
 # Claude Code Session Manager
 
 A skill for managing Claude Code sessions as reusable domain experts. Instead of starting fresh each time, sessions that have accumulated deep context in specific functional areas are documented and can be resumed when related work arises.
