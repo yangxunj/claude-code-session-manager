@@ -121,6 +121,27 @@ def load_session_experts():
     return experts
 
 
+def is_forked_session(jsonl_path):
+    """Check if a session is a fork by inspecting the first message's forkedFrom field.
+
+    Forked sessions cannot be resumed by Claude Code. The activate command
+    will automatically strip forkedFrom fields to make them resumable.
+    """
+    if not jsonl_path.exists():
+        return False
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                return bool(obj.get("forkedFrom"))
+            except json.JSONDecodeError:
+                continue
+    return False
+
+
 def get_last_timestamp_from_jsonl(jsonl_path):
     """Read the timestamp of the last message with a timestamp from a .jsonl file."""
     if not jsonl_path.exists():
@@ -187,6 +208,7 @@ def cmd_list():
         jsonl_path = project_dir / f"{sid}.jsonl"
         file_size = jsonl_path.stat().st_size if jsonl_path.exists() else 0
         real_ts = real_timestamps.get(sid, e.get("modified", ""))
+        forked = is_forked_session(jsonl_path)
         sessions.append({
             "id": sid,
             "real_ts": real_ts,
@@ -196,6 +218,7 @@ def cmd_list():
             "custom_title": e.get("customTitle", "") or "",
             "file_size": file_size,
             "expert": experts.get(sid, ""),
+            "forked": forked,
         })
 
     # Sort by real timestamp (descending)
@@ -205,9 +228,16 @@ def cmd_list():
     print(f"Total {len(sessions)} sessions (top {RESUMABLE_LIMIT} are resumable)")
     print("=" * 110)
 
+    fork_count = 0
     for i, s in enumerate(sessions):
         is_resumable = i < RESUMABLE_LIMIT
-        status = " OK " if is_resumable else "----"
+        if s["forked"]:
+            status = "FORK"
+            fork_count += 1
+        elif is_resumable:
+            status = " OK "
+        else:
+            status = "----"
         ts_display = s["real_ts"][:19].replace("T", " ") if s["real_ts"] else "N/A"
         size_str = format_size(s["file_size"])
 
@@ -221,7 +251,9 @@ def cmd_list():
         print(f"  [{status}] {i + 1:>3}. {sid_short}... | {ts_display} | {s['msgs']:>3} msgs | {size_str:>7} | {name}")
 
     print()
-    print("Hint: [OK] = resumable, [----] = needs `activate` first")
+    print("Hint: [OK] = resumable, [----] = needs `activate` first, [FORK] = forked session (needs `activate` to fix)")
+    if fork_count:
+        print(f"Found {fork_count} forked session(s). Running `activate` will auto-remove forkedFrom fields.")
     print(f"Usage: python scripts/claude-session.py activate <session-id>")
 
 
@@ -269,14 +301,46 @@ def cmd_activate(target_id):
     # Generate new timestamp (current time)
     now = datetime.now(timezone.utc)
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    now_mtime = int(now.timestamp() * 1000)
 
-    # ── Step 1: Modify timestamps in the .jsonl file ──
-    print("Step 1: Modifying chat log timestamps...")
+    # ── Step 1: Read and process the .jsonl file ──
     with open(jsonl_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
-    # Find and modify the last 5 messages with timestamps
+    # Detect if this is a forked session (check first message)
+    is_fork = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            first_obj = json.loads(stripped)
+            is_fork = bool(first_obj.get("forkedFrom"))
+            break
+        except json.JSONDecodeError:
+            continue
+
+    # If forked, strip forkedFrom from all messages (required for resumability)
+    if is_fork:
+        print("Step 1a: Forked session detected, removing forkedFrom fields...")
+        fork_removed = 0
+        for idx in range(len(lines)):
+            stripped = lines[idx].strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if "forkedFrom" in obj:
+                del obj["forkedFrom"]
+                lines[idx] = json.dumps(obj, ensure_ascii=False) + "\n"
+                fork_removed += 1
+        print(f"  Removed forkedFrom from {fork_removed} messages")
+        print()
+
+    # Modify timestamps of the last few messages
+    step_label = "Step 1b" if is_fork else "Step 1"
+    print(f"{step_label}: Modifying chat log timestamps...")
     modified_count = 0
     for idx in range(len(lines) - 1, max(len(lines) - 6, -1), -1):
         line = lines[idx].strip()
@@ -301,6 +365,9 @@ def cmd_activate(target_id):
         f.writelines(lines)
     print(f"  Modified {modified_count} message timestamps")
 
+    # Read actual file mtime after writing (Claude Code validates this)
+    actual_mtime = int(jsonl_path.stat().st_mtime * 1000)
+
     # ── Step 2: Update sessions-index.json ──
     print()
     print("Step 2: Updating index file...")
@@ -308,8 +375,9 @@ def cmd_activate(target_id):
         if e["sessionId"] == sid:
             old_modified = e.get("modified", "N/A")
             e["modified"] = now_iso
-            e["fileMtime"] = now_mtime
+            e["fileMtime"] = actual_mtime
             print(f"  modified: {old_modified} -> {now_iso}")
+            print(f"  fileMtime: {actual_mtime}")
             break
 
     save_sessions_index(project_dir, index_data)

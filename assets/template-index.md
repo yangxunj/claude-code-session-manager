@@ -27,9 +27,25 @@ This file records all valuable Claude Code sessions (conversation experts) in th
 - `outdated` — Related code has changed significantly, context may be stale, for reference only
 - `superseded:S0XX` — Has been replaced by the specified session
 
-**Session Registration Flow:**
+**Session Registration & Update Guide:**
 
-When a session has accumulated sufficient domain context and needs to be registered as an expert, complete these steps:
+When the user asks you to register or update your session info, choose the appropriate scenario below. The user will provide your Session ID.
+
+**Scenario A: New Session Registration**
+
+Applies when: you have accumulated deep context in a new functional domain and need to register as an expert for the first time.
+
+Step 1 — Overlap assessment (must do first):
+
+Read the index table below and determine if any existing session highly overlaps with your work. If needed, check the details file for that session's functional domain description.
+
+- If an existing session's tags, functional domains, and files overlap >60% with yours, that domain already has an expert — **do NOT register**
+- If your work is only minor fixes or parameter tweaks to an existing session's domain, **do NOT register**
+- Only register when you have accumulated **independent context that no existing session possesses**
+
+If you determine you should NOT register, tell the user: "Session [S0XX] already covers the main content of this work. Future related work should continue using that session — no need to register a duplicate." Then stop.
+
+Step 2 — Execute registration (only if assessment passes):
 
 1. **Update index table**: Add a new row in this file's index table
 2. **Update page tree**: Mount the session ID on the corresponding page node
@@ -37,7 +53,16 @@ When a session has accumulated sufficient domain context and needs to be registe
 4. **Update details file**: Add functional domain descriptions and files in the details file
 5. **Commit to git**: Commit all changes together
 
-**Registration Granularity Guidelines:**
+**Scenario B: Update Existing Registration**
+
+Applies when: you are an already-registered session expert, and after further development, your functional scope has changed.
+
+1. **Read current registration**: Find your entries in the index table, page tree, file path index, and details file
+2. **Compare with actual work**: Compare the context accumulated in this conversation against your registered info — identify differences (new functional domains? new files involved? tags need adjusting?)
+3. **Update all four records**: Index table (name/tags), page tree (node mounts), file path index (add/remove paths), details file (core abilities/files)
+4. **Commit to git**
+
+**Granularity guidelines (applies to both registration and updates):**
 
 Session documentation exists for **routing** — helping new sessions quickly find "who should handle this problem", not for recording work logs. After resuming a session, the complete conversation context is already there; the documentation doesn't need to repeat it.
 

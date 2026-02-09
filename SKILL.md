@@ -5,8 +5,9 @@ description: |
   (1) Setting up session management for a new project (initialization)
   (2) A user requests a feature change, bug fix, or optimization and you need to check if a session expert already handles that domain (routing)
   (3) A session has accumulated deep domain context and should register itself as an expert (registration)
-  (4) A session is expired and needs to be activated for resuming (activation)
-  (5) The user asks about managing, organizing, or optimizing session documentation
+  (4) An existing session expert needs to update its registration after scope changes (update)
+  (5) A session is expired and needs to be activated for resuming (activation)
+  (6) The user asks about managing, organizing, or optimizing session documentation
 ---
 
 # Session Manager
@@ -28,6 +29,9 @@ User request arrives
 │
 ├─ "Register this session as an expert"
 │   └─ Go to → Register
+│
+├─ "Update this session's registration"
+│   └─ Go to → Update
 │
 ├─ "Activate / resume an old session"
 │   └─ Go to → Activate
@@ -75,20 +79,30 @@ When a session has accumulated significant domain context, register it as an exp
 
 **Prerequisites:** The session must have genuine, independent domain context that no existing session covers.
 
-**Steps:**
+**How to trigger:** Tell the session to read the index file and follow its built-in registration guide. For example:
 
-1. Read the self-registration prompt from `references/registration-prompt.md`
-2. Copy the prompt template and fill in `<session-id>` (find it via `python scripts/claude-session.py list` — rank #1 is the current session)
-3. Paste the completed prompt into the session's conversation
-4. The session will self-evaluate overlap and register if appropriate
+```
+Read `doc/reference/claude-sessions.md` — follow "Scenario A: New Session Registration" in the Registration & Update Guide. Your Session ID is: <session-id>
+```
 
-**Registration writes to 4 places:**
-- Index table (new row)
-- Page tree (mount on relevant nodes)
-- File path index (add key files)
-- Details file (functional domain description)
+To find the session ID: `python scripts/claude-session.py list` — rank #1 is the current session.
 
-See `references/registration-prompt.md` for the full prompt template and instructions.
+The index file's built-in guide will instruct the session to:
+1. Self-evaluate overlap against existing sessions (>60% overlap = do not register)
+2. If assessment passes, write to 4 places: index table, page tree, file path index, details file
+3. Commit to git
+
+## Update
+
+When an existing session expert's scope has changed after further development, update its registration.
+
+**How to trigger:**
+
+```
+Read `doc/reference/claude-sessions.md` — follow "Scenario B: Update Existing Registration" in the Registration & Update Guide. Your Session ID is: <session-id>
+```
+
+The session will compare its current context against its registered info and update all four records accordingly.
 
 ## Activate
 
@@ -123,12 +137,8 @@ Guidelines for keeping session documentation healthy:
 
 - `claude-session.py` — Session management CLI tool (list sessions, activate expired ones). Copy to the target project's `scripts/` directory.
 
-### references/
-
-- `registration-prompt.md` — Self-registration prompt template for sessions to evaluate and register themselves as experts.
-
 ### assets/
 
-- `template-index.md` — Template for the session index file (index table + page tree + file path index + registration guidelines)
+- `template-index.md` — Template for the session index file (index table + page tree + file path index + built-in registration & update guide)
 - `template-details.md` — Template for the session details file (per-session functional domain descriptions)
 - `template-claude-md-snippet.md` — CLAUDE.md integration snippet (routing workflow + tool usage instructions)
