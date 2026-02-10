@@ -163,6 +163,59 @@ def get_last_timestamp_from_jsonl(jsonl_path):
     return last_ts
 
 
+def build_index_entry_from_jsonl(jsonl_path):
+    """Build a sessions-index entry from a .jsonl file (for sessions missing from the index)."""
+    sid = jsonl_path.stem
+    first_ts = None
+    last_ts = None
+    first_prompt = ""
+    msg_count = 0
+
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg_count += 1
+            ts = obj.get("timestamp")
+            if ts and ts != "N/A":
+                if first_ts is None:
+                    first_ts = ts
+                last_ts = ts
+            # Extract firstPrompt from the first user message
+            if not first_prompt and obj.get("type") == "user":
+                msg = obj.get("message", {})
+                if isinstance(msg, dict):
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        first_prompt = content[:200]
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                first_prompt = (part.get("text") or "")[:200]
+                                break
+
+    file_mtime = int(jsonl_path.stat().st_mtime * 1000)
+
+    return {
+        "sessionId": sid,
+        "fullPath": str(jsonl_path),
+        "fileMtime": file_mtime,
+        "firstPrompt": first_prompt,
+        "summary": "",
+        "messageCount": msg_count,
+        "created": first_ts or "",
+        "modified": last_ts or "",
+        "gitBranch": "main",
+        "projectPath": str(Path.cwd()),
+        "isSidechain": False,
+    }
+
+
 def get_session_last_timestamps(project_dir):
     """Get last message timestamps for all sessions, return {session_id: timestamp_str}."""
     result = {}
@@ -271,9 +324,33 @@ def cmd_activate(target_id):
         matches = [e for e in entries if target_id in e["sessionId"]]
 
     if not matches:
-        print(f"Error: no session matching '{target_id}'")
-        sys.exit(1)
-    elif len(matches) > 1:
+        # Not in index — check for .jsonl files on disk
+        disk_matches = list(project_dir.glob(f"{target_id}*.jsonl"))
+        if not disk_matches:
+            disk_matches = [f for f in project_dir.glob("*.jsonl")
+                           if target_id in f.stem and not f.stem.startswith("agent-")]
+        if not disk_matches:
+            print(f"Error: no session matching '{target_id}' (checked both index and disk)")
+            sys.exit(1)
+        if len(disk_matches) > 1:
+            print(f"Error: '{target_id}' matches multiple files on disk:")
+            for f in disk_matches:
+                print(f"  {f.stem}")
+            print("Please provide a more specific ID")
+            sys.exit(1)
+
+        # Build index entry from .jsonl file and register it
+        jsonl_file = disk_matches[0]
+        print(f"Not found in index, but exists on disk: {jsonl_file.name}")
+        print("Building index entry from chat log...")
+        new_entry = build_index_entry_from_jsonl(jsonl_file)
+        index_data["entries"].append(new_entry)
+        save_sessions_index(project_dir, index_data)
+        print(f"  Registered in sessions-index.json ({new_entry['messageCount']} messages)")
+        print()
+        matches = [new_entry]
+
+    if len(matches) > 1:
         print(f"Error: '{target_id}' matches multiple sessions:")
         for m in matches:
             print(f"  {m['sessionId']}")
