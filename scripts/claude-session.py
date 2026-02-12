@@ -248,6 +248,10 @@ def cmd_list():
     index_data = load_sessions_index(project_dir)
     entries = index_data.get("entries", [])
 
+    # Get the mtime of sessions-index.json itself (used to distinguish stale vs active mtime mismatches)
+    index_file_path = project_dir / "sessions-index.json"
+    index_file_mtime = int(index_file_path.stat().st_mtime * 1000)
+
     # Load session expert mapping
     experts = load_session_experts()
 
@@ -259,9 +263,28 @@ def cmd_list():
     for e in entries:
         sid = e["sessionId"]
         jsonl_path = project_dir / f"{sid}.jsonl"
-        file_size = jsonl_path.stat().st_size if jsonl_path.exists() else 0
+        file_exists = jsonl_path.exists()
+        file_size = jsonl_path.stat().st_size if file_exists else 0
         real_ts = real_timestamps.get(sid, e.get("modified", ""))
-        forked = is_forked_session(jsonl_path)
+        forked = is_forked_session(jsonl_path) if file_exists else False
+
+        # Check fileMtime consistency
+        # mtime_status: "ok" / "stale" / "active"
+        # - ok:     fileMtime in index matches actual file mtime
+        # - stale:  .jsonl was modified BEFORE index was last written, but index has wrong mtime (real problem)
+        # - active: .jsonl was modified AFTER index was last written (normal Claude Code writes, harmless)
+        mtime_status = "ok"
+        if file_exists:
+            actual_mtime = int(jsonl_path.stat().st_mtime * 1000)
+            index_mtime = e.get("fileMtime", 0)
+            if actual_mtime != index_mtime:
+                if actual_mtime <= index_file_mtime:
+                    # File was modified before last index write, but index has wrong value → real problem
+                    mtime_status = "stale"
+                else:
+                    # File was modified after last index write (normal Claude Code writes)
+                    mtime_status = "active"
+
         sessions.append({
             "id": sid,
             "real_ts": real_ts,
@@ -272,6 +295,7 @@ def cmd_list():
             "file_size": file_size,
             "expert": experts.get(sid, ""),
             "forked": forked,
+            "mtime_status": mtime_status,
         })
 
     # Sort by real timestamp (descending)
@@ -282,11 +306,15 @@ def cmd_list():
     print("=" * 110)
 
     fork_count = 0
+    stale_count = 0
     for i, s in enumerate(sessions):
         is_resumable = i < RESUMABLE_LIMIT
         if s["forked"]:
             status = "FORK"
             fork_count += 1
+        elif is_resumable and s["mtime_status"] == "stale":
+            status = "STAL"
+            stale_count += 1
         elif is_resumable:
             status = " OK "
         else:
@@ -304,9 +332,11 @@ def cmd_list():
         print(f"  [{status}] {i + 1:>3}. {sid_short}... | {ts_display} | {s['msgs']:>3} msgs | {size_str:>7} | {name}")
 
     print()
-    print("Hint: [OK] = resumable, [----] = needs `activate` first, [FORK] = forked session (needs `activate` to fix)")
+    print("Hint: [OK] = resumable, [----] = needs `activate`, [FORK] = forked session, [STAL] = stale index (needs `activate`)")
     if fork_count:
         print(f"Found {fork_count} forked session(s). Running `activate` will auto-remove forkedFrom fields.")
+    if stale_count:
+        print(f"Found {stale_count} session(s) with stale index entries. Run `activate` to fix before resuming.")
     print(f"Usage: python scripts/claude-session.py activate <session-id>")
 
 
