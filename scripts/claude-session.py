@@ -298,18 +298,48 @@ def cmd_list():
             "mtime_status": mtime_status,
         })
 
+    # Detect .jsonl files on disk that are missing from the index
+    indexed_ids = {e["sessionId"] for e in entries}
+    orphan_count = 0
+    for f in project_dir.iterdir():
+        if (f.suffix == ".jsonl"
+                and f.stem != "sessions-index"
+                and not f.stem.startswith("agent-")
+                and f.stem not in indexed_ids):
+            sid = f.stem
+            real_ts = real_timestamps.get(sid, "")
+            forked = is_forked_session(f)
+            sessions.append({
+                "id": sid,
+                "real_ts": real_ts,
+                "index_modified": "",
+                "msgs": 0,  # Skip full parse to keep list fast
+                "summary": "",
+                "custom_title": "",
+                "file_size": f.stat().st_size,
+                "expert": experts.get(sid, ""),
+                "forked": forked,
+                "mtime_status": "orphan",  # File on disk but missing from index
+            })
+            orphan_count += 1
+
     # Sort by real timestamp (descending)
     sessions.sort(key=lambda x: x["real_ts"], reverse=True)
 
     # Display
-    print(f"Total {len(sessions)} sessions (top {RESUMABLE_LIMIT} are resumable)")
+    total_indexed = len(entries)
+    print(f"Total {len(sessions)} sessions (indexed {total_indexed} + unindexed {orphan_count}, top {RESUMABLE_LIMIT} resumable)")
     print("=" * 110)
 
     fork_count = 0
     stale_count = 0
+    orphan_display_count = 0
     for i, s in enumerate(sessions):
         is_resumable = i < RESUMABLE_LIMIT
-        if s["forked"]:
+        if s["mtime_status"] == "orphan":
+            status = "ORPH"
+            orphan_display_count += 1
+        elif s["forked"]:
             status = "FORK"
             fork_count += 1
         elif is_resumable and s["mtime_status"] == "stale":
@@ -328,15 +358,18 @@ def cmd_list():
             name = s["custom_title"][:40] if s["custom_title"] else s["summary"][:40]
 
         sid_short = s["id"][:8]
+        msgs_str = f"{s['msgs']:>3} msgs" if s["mtime_status"] != "orphan" else "  ? msgs"
 
-        print(f"  [{status}] {i + 1:>3}. {sid_short}... | {ts_display} | {s['msgs']:>3} msgs | {size_str:>7} | {name}")
+        print(f"  [{status}] {i + 1:>3}. {sid_short}... | {ts_display} | {msgs_str} | {size_str:>7} | {name}")
 
     print()
-    print("Hint: [OK] = resumable, [----] = needs `activate`, [FORK] = forked session, [STAL] = stale index (needs `activate`)")
+    print("Hint: [OK] = resumable, [----] = needs `activate`, [FORK] = forked, [STAL] = stale index, [ORPH] = unindexed")
     if fork_count:
         print(f"Found {fork_count} forked session(s). Running `activate` will auto-remove forkedFrom fields.")
     if stale_count:
         print(f"Found {stale_count} session(s) with stale index entries. Run `activate` to fix before resuming.")
+    if orphan_display_count:
+        print(f"Found {orphan_display_count} session(s) on disk but missing from index. Run `activate` to register.")
     print(f"Usage: python scripts/claude-session.py activate <session-id>")
 
 
