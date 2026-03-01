@@ -68,18 +68,18 @@ Session documentation exists for **routing** — helping new sessions quickly fi
 
 Tags should be functional domain keywords only (5-8), not implementation details:
 
-- Good: `dimension-weights, score-calculation, grading-strategy`
-- Bad: `LIST_IGNORE, fileList, originFileObj, slider-tooltip`
+- ✅ `dimension-weights, score-calculation, grading-strategy`
+- ❌ `LIST_IGNORE, fileList, originFileObj, slider-tooltip`
 
 Core abilities should describe "what I understand", not "what I changed":
 
-- Good: `antd-img-crop cropping component integration and source-level understanding`
-- Bad: `After antd-img-crop cropping, if beforeUpload returns false, antd Upload still keeps the original file's originFileObj...`
+- ✅ `antd-img-crop cropping component integration and source-level understanding`
+- ❌ `After antd-img-crop cropping, if beforeUpload returns false, antd Upload still keeps the original file's originFileObj...`
 
 File paths should be paths only, no parenthetical annotations:
 
-- Good: `frontend/src/components/UploadModal.tsx`
-- Bad: `frontend/src/components/UploadModal.tsx` (core: ImgCrop integration + beforeUpload changed to LIST_IGNORE mode)
+- ✅ `frontend/src/components/UploadModal.tsx`
+- ❌ `frontend/src/components/UploadModal.tsx (core: ImgCrop integration + beforeUpload changed to LIST_IGNORE mode)`
 
 **Resuming expired sessions:**
 

@@ -25,7 +25,16 @@ Claude Code only allows resuming the ~10 most recent sessions, but all chat data
 
 1. **Two-layer documentation** — A lightweight index file (tags, page tree, file path index) for quick routing, plus a details file for functional domain descriptions
 2. **Built-in registration & update guide** — The index file template includes a complete guide for sessions to self-evaluate overlap (>60% threshold) and register/update themselves — no separate prompt needed
-3. **Activation script** — A Python CLI tool that modifies timestamps to bring old sessions back into the resumable window, with automatic detection and repair of forked sessions
+3. **Activation script** — A Python CLI tool that modifies timestamps to bring old sessions back into the resumable window, with comprehensive health checks:
+
+   | Status | Meaning | Action |
+   |--------|---------|--------|
+   | `[OK]` | Resumable | `claude --resume <id>` directly |
+   | `[----]` | Outside top-10 window | Run `activate` to bring it back |
+   | `[FORK]` | Forked session (cannot resume) | Run `activate` to auto-strip `forkedFrom` fields |
+   | `[STAL]` | Stale index entry (`fileMtime` mismatch) | Run `activate` to sync |
+   | `[ORPH]` | File on disk but missing from index | Run `activate` to auto-register |
+
 4. **CLAUDE.md integration** — A snippet that instructs AI to check for session experts before handling requests
 
 ## Files
