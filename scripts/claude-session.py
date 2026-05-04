@@ -5,22 +5,29 @@ Claude Code Session Management Tool
 Features:
   list     - List all sessions for the current project, showing resumable status
   activate - Activate a session so it can be resumed via `claude --resume`
+  backup   - Incrementally back up all jsonl files to a sibling directory
+  restore  - Restore a backed-up jsonl back to ~/.claude/projects/<project>/
 
 Background:
   Claude Code only allows resuming the ~10 most recent sessions (sorted by the
-  last message timestamp in each .jsonl file). Older sessions still have their
-  complete chat data on disk but cannot be resumed. This tool modifies timestamps
-  to bring old sessions back into the resumable window.
+  last message timestamp in each .jsonl file), and it periodically purges the
+  jsonl files under ~/.claude/projects/<project>/. This tool both shifts
+  timestamps (to bring old sessions back into the resumable window) and
+  maintains a sibling-directory backup so purged sessions can be restored.
 
 Usage:
   python scripts/claude-session.py list
   python scripts/claude-session.py activate <session-id>
-  python scripts/claude-session.py activate <partial-id>
+  python scripts/claude-session.py backup [--quiet] [--async]
+  python scripts/claude-session.py restore <session-id> [--force]
+  python scripts/claude-session.py restore --all
 """
 
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +42,7 @@ if sys.platform == "win32":
 
 CLAUDE_HOME = Path.home() / ".claude"
 RESUMABLE_LIMIT = 10  # Number of recent sessions Claude Code allows resuming
+ARCHIVE_ENV_VAR = "CLAUDE_SESSION_ARCHIVES"  # Optional: override default archive directory
 
 
 def get_project_storage_dir():
@@ -529,6 +537,357 @@ def cmd_activate(target_id):
     print(f"  claude --resume {sid}")
 
 
+# ── backup / restore shared helpers ──────────────────────────────────
+
+def get_archive_dir():
+    """Resolve the archive directory.
+
+    Default: <cwd parent>/<cwd name>-session-archives/
+    Override: set CLAUDE_SESSION_ARCHIVES environment variable.
+
+    The default puts the archive in a sibling directory of the project so it:
+      - lives outside the main repo (won't be pushed to GitHub, no 100MB limit)
+      - is computed deterministically from cwd (no config file needed)
+    """
+    env_override = os.environ.get(ARCHIVE_ENV_VAR)
+    if env_override:
+        return Path(env_override)
+    cwd = Path.cwd()
+    return cwd.parent / f"{cwd.name}-session-archives"
+
+
+def count_jsonl_lines(path):
+    """Count non-empty lines in a jsonl file (each line is one message)."""
+    if not path.exists():
+        return 0
+    count = 0
+    with open(path, "rb") as f:
+        for line in f:
+            if line.strip():
+                count += 1
+    return count
+
+
+def validate_jsonl_tail(path):
+    """Validate that a jsonl file's last non-empty line is parseable JSON.
+
+    Returns (ok: bool, reason: str). Used to detect truncation/corruption
+    before letting a damaged source overwrite a good backup.
+    """
+    if not path.exists():
+        return False, "file does not exist"
+    try:
+        last_line = None
+        with open(path, "rb") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    last_line = line
+        if last_line is None:
+            return False, "file is empty"
+        json.loads(last_line.decode("utf-8"))
+        return True, ""
+    except json.JSONDecodeError as e:
+        return False, f"last line failed JSON parse: {e}"
+    except Exception as e:
+        return False, f"read failed: {e}"
+
+
+def spawn_async_self(extra_args):
+    """Re-launch this script as a detached process and return immediately.
+
+    Used by `backup --async` so the SessionStart hook doesn't add startup
+    latency. Cross-platform: uses Windows DETACHED_PROCESS flags or POSIX
+    start_new_session.
+    """
+    args = [sys.executable, str(Path(__file__).resolve())] + extra_args
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if sys.platform == "win32":
+        # DETACHED_PROCESS = 0x00000008
+        # CREATE_NEW_PROCESS_GROUP = 0x00000200
+        # CREATE_NO_WINDOW = 0x08000000
+        kwargs["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen(args, **kwargs)
+
+
+def write_log(archive_dir, msg):
+    """Append a timestamped line to <archive>/backup.log."""
+    log_path = archive_dir / "backup.log"
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        with open(log_path, "a", encoding="utf-8", newline="\n") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
+
+
+# ── backup command ───────────────────────────────────────────────────
+
+def cmd_backup(argv):
+    """Incrementally back up all jsonl files to the archive directory.
+
+    Behavior:
+      - Sources: ~/.claude/projects/<project>/*.jsonl (and *.jsonl.bak for
+        legacy artifacts)
+      - For each source:
+          * not in archive yet → copy
+          * in archive, sizes/lines match → skip (unchanged)
+          * in archive, source has more lines → copy (jsonl is append-only)
+          * in archive, source has FEWER lines → SKIP + WARN (truncation/corruption)
+      - Source last-line JSON must parse, otherwise skip
+      - Backup is never deleted, even if source disappears (the whole point)
+      - MANIFEST.md is regenerated after each run
+    """
+    quiet = "--quiet" in argv
+    if "--async" in argv:
+        # Re-launch self as a detached process, drop --async
+        new_args = [a for a in argv if a != "--async"]
+        spawn_async_self(["backup"] + new_args)
+        return
+
+    project_dir = get_project_storage_dir()
+    archive_dir = get_archive_dir()
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    if not project_dir.exists():
+        if not quiet:
+            print(f"Project storage path does not exist: {project_dir}")
+        write_log(archive_dir, f"backup skipped: project_dir missing ({project_dir})")
+        sys.exit(0)
+
+    if not quiet:
+        print(f"Source: {project_dir}")
+        print(f"Target: {archive_dir}")
+        print()
+
+    # Collect all jsonl / jsonl.bak files in the source
+    sources = []
+    for f in project_dir.iterdir():
+        if not f.is_file():
+            continue
+        # Only back up .jsonl and .jsonl.bak; skip sessions-index.json and agent-* temp files
+        if f.name == "sessions-index.json":
+            continue
+        if f.name.startswith("agent-"):
+            continue
+        if f.suffix == ".jsonl" or f.name.endswith(".jsonl.bak"):
+            sources.append(f)
+
+    if not sources:
+        if not quiet:
+            print("No jsonl files in source to back up")
+        write_log(archive_dir, "backup skipped: no jsonl files in source")
+        return
+
+    copied = 0
+    skipped_unchanged = 0
+    skipped_corrupt = 0
+    warnings = []
+
+    for src in sorted(sources, key=lambda p: p.name):
+        dest = archive_dir / src.name
+
+        # Validate the source itself
+        ok, reason = validate_jsonl_tail(src)
+        if not ok:
+            warnings.append(f"  [SKIP] {src.name} - source validation failed: {reason}")
+            skipped_corrupt += 1
+            continue
+
+        if dest.exists():
+            src_lines = count_jsonl_lines(src)
+            dest_lines = count_jsonl_lines(dest)
+
+            if src_lines == dest_lines and src.stat().st_size == dest.stat().st_size:
+                skipped_unchanged += 1
+                continue
+
+            if src_lines < dest_lines:
+                # jsonl is append-only — fewer lines in source means truncation/corruption
+                warnings.append(
+                    f"  [WARN] {src.name} - source lines {src_lines} < backup lines {dest_lines}, skipping overwrite"
+                )
+                skipped_corrupt += 1
+                continue
+
+        # Validation passed → copy (preserve mtime)
+        shutil.copy2(src, dest)
+        copied += 1
+        if not quiet:
+            print(f"  [OK]   {src.name} ({format_size(src.stat().st_size)})")
+
+    # Rebuild MANIFEST
+    manifest_path = archive_dir / "MANIFEST.md"
+    write_manifest(archive_dir, manifest_path)
+
+    summary = (
+        f"backup done: copied={copied} unchanged={skipped_unchanged} "
+        f"corrupt_skipped={skipped_corrupt}"
+    )
+    if warnings:
+        summary += " [HAS WARNINGS]"
+    write_log(archive_dir, summary)
+    for w in warnings:
+        write_log(archive_dir, w.strip())
+
+    if not quiet:
+        print()
+        print(f"Done: copied {copied}, unchanged {skipped_unchanged}, skipped {skipped_corrupt}")
+        if warnings:
+            print()
+            print("Warnings:")
+            for w in warnings:
+                print(w)
+
+
+def write_manifest(archive_dir, manifest_path):
+    """Rebuild MANIFEST.md based on the archive directory's current contents."""
+    experts = load_session_experts()  # session-id → "S0XX Name"
+    files = sorted(
+        [
+            f for f in archive_dir.iterdir()
+            if f.is_file() and (f.suffix == ".jsonl" or f.name.endswith(".jsonl.bak"))
+        ],
+        key=lambda p: p.name,
+    )
+
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [
+        "# Session Archives Manifest",
+        "",
+        f"Last updated: {now_iso}",
+        "",
+        f"Archive count: {len(files)}",
+        "",
+        "| Session ID | Registered | Size | Source last modified | Backup mtime | Notes |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for f in files:
+        is_bak = f.name.endswith(".jsonl.bak")
+        sid = f.name[:-len(".jsonl.bak")] if is_bak else f.stem
+        expert = experts.get(sid, "")
+        size = format_size(f.stat().st_size)
+        # Last message timestamp from the source jsonl (if still present)
+        project_dir = get_project_storage_dir()
+        src_path = project_dir / f.name
+        if src_path.exists():
+            src_last_ts = get_last_timestamp_from_jsonl(src_path) or "N/A"
+        else:
+            src_last_ts = "(source purged by Claude Code)"
+        backup_mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        note = ".bak (legacy rescue artifact)" if is_bak else ""
+        lines.append(
+            f"| `{sid[:8]}...` | {expert or '—'} | {size} | {src_last_ts[:19]} | {backup_mtime} | {note} |"
+        )
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("Auto-generated by `scripts/claude-session.py backup`. Do not edit manually.")
+    lines.append("")
+
+    with open(manifest_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines))
+
+
+# ── restore command ──────────────────────────────────────────────────
+
+def cmd_restore(argv):
+    """Restore a backed-up jsonl back to ~/.claude/projects/<project>/.
+
+    Refuses to overwrite a live file that has more lines than the backup
+    (live is canonical when newer); pass --force to override.
+    """
+    if not argv:
+        print("Error: please provide a session-id or --all")
+        print("Usage: python scripts/claude-session.py restore <session-id> [--force]")
+        print("       python scripts/claude-session.py restore --all")
+        sys.exit(1)
+
+    project_dir = get_project_storage_dir()
+    archive_dir = get_archive_dir()
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    if not archive_dir.exists():
+        print(f"Error: archive directory does not exist: {archive_dir}")
+        sys.exit(1)
+
+    force = "--force" in argv
+    target = next((a for a in argv if not a.startswith("--")), None)
+
+    if target == "--all" or "--all" in argv:
+        # Bulk restore: only copy files missing from source (don't overwrite existing)
+        restored = 0
+        skipped = 0
+        for f in archive_dir.iterdir():
+            if not (f.suffix == ".jsonl" or f.name.endswith(".jsonl.bak")):
+                continue
+            dest = project_dir / f.name
+            if dest.exists() and not force:
+                skipped += 1
+                continue
+            shutil.copy2(f, dest)
+            restored += 1
+            print(f"  Restored {f.name}")
+        print()
+        print(f"Done: restored {restored}, skipped {skipped} (already present; use --force to overwrite)")
+        return
+
+    if not target:
+        print("Error: please provide a session-id")
+        sys.exit(1)
+
+    # Partial ID matching against archive contents
+    matches = []
+    for f in archive_dir.iterdir():
+        if not f.is_file():
+            continue
+        if not (f.suffix == ".jsonl" or f.name.endswith(".jsonl.bak")):
+            continue
+        sid = f.name[:-len(".jsonl.bak")] if f.name.endswith(".jsonl.bak") else f.stem
+        if sid.startswith(target) or target in sid:
+            matches.append((sid, f))
+
+    if not matches:
+        print(f"Error: no archive matching '{target}'")
+        sys.exit(1)
+    if len(matches) > 1:
+        print(f"Error: '{target}' matches multiple archives:")
+        for sid, f in matches:
+            print(f"  {f.name}")
+        print("Please provide a more specific ID")
+        sys.exit(1)
+
+    sid, src = matches[0]
+    dest = project_dir / src.name
+
+    if dest.exists() and not force:
+        # Compare line counts; if live is at least as long as backup, restoration is meaningless
+        live_lines = count_jsonl_lines(dest)
+        backup_lines = count_jsonl_lines(src)
+        if live_lines >= backup_lines:
+            print(f"Notice: live {src.name} lines ({live_lines}) >= backup ({backup_lines}); restore unnecessary")
+            print("Pass --force to overwrite anyway")
+            sys.exit(0)
+        else:
+            print(f"Warning: target exists but has fewer lines ({live_lines} < backup {backup_lines})")
+            print("Pass --force to overwrite")
+            sys.exit(1)
+
+    shutil.copy2(src, dest)
+    print(f"Restored {src.name} to {project_dir}")
+    print()
+    print("Next steps:")
+    print(f"  python scripts/claude-session.py activate {sid}")
+    print(f"  claude --resume {sid}")
+
+
 # ── Main entry ───────────────────────────────────────────────────────
 
 def main():
@@ -546,9 +905,13 @@ def main():
             print("Usage: python scripts/claude-session.py activate <session-id>")
             sys.exit(1)
         cmd_activate(sys.argv[2])
+    elif command == "backup":
+        cmd_backup(sys.argv[2:])
+    elif command == "restore":
+        cmd_restore(sys.argv[2:])
     else:
         print(f"Unknown command: {command}")
-        print("Available commands: list, activate")
+        print("Available commands: list, activate, backup, restore")
         sys.exit(1)
 
 

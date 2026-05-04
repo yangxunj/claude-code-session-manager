@@ -83,20 +83,26 @@ File paths should be paths only, no parenthetical annotations:
 
 **Resuming expired sessions:**
 
-Claude Code only allows resuming the ~10 most recent sessions (sorted by last message timestamp), but all session chat data is permanently stored on disk (`~/.claude/projects/`).
-
-When you need to resume a session that has fallen out of the top 10:
+Claude Code only allows resuming the ~10 most recent sessions (sorted by last message timestamp). **Note: Claude Code also periodically purges jsonl files under `~/.claude/projects/<project>/`** — once purged, `--resume` cannot recover them directly. This project maintains a local backup in `<project-parent>/<project-name>-session-archives/` so purged sessions can be restored via the `restore` command.
 
 ```bash
 # View all session statuses
 python scripts/claude-session.py list
 
-# Activate a specific session (supports partial ID matching)
+# Case A: jsonl still on disk but fell out of the top 10 → activate
+python scripts/claude-session.py activate <session-id>
+
+# Case B: jsonl already purged by Claude Code (list shows missing/0B file) → restore first, then activate
+python scripts/claude-session.py restore <session-id>
 python scripts/claude-session.py activate <session-id>
 
 # Then resume normally
 claude --resume <session-id>
 ```
+
+**Backup mechanism:** A SessionStart hook in `.claude/settings.json` automatically runs `backup --quiet --async` every time Claude Code starts. See the project's `CLAUDE.md` "Session backup / restore mechanism" section for details.
+
+**Permanently lost sessions:** When a jsonl was purged before the backup mechanism was set up (or when the archive itself was lost), the corresponding session cannot be resumed. Mark such entries by adding a separate "Permanently lost sessions" subsection at the bottom of this file — list them so the AI can still route by domain match (the index entry remains useful even when `--resume` won't work).
 
 ---
 

@@ -24,6 +24,9 @@ User request arrives
 ├─ "Set up session management for this project"
 │   └─ Go to → Initialize
 │
+├─ "This project already uses session-manager — sync it to the latest version"
+│   └─ Go to → Migrate
+│
 ├─ Feature change / bug fix / optimization request
 │   └─ Go to → Route
 │
@@ -35,6 +38,9 @@ User request arrives
 │
 ├─ "Activate / resume an old session"
 │   └─ Go to → Activate
+│
+├─ "Restore a session whose jsonl was purged by Claude Code"
+│   └─ Go to → Restore
 │
 └─ "Optimize session documentation structure"
     └─ Go to → Maintain
@@ -50,10 +56,35 @@ Set up session management for a project that doesn't have it yet.
 2. Copy `assets/template-details.md` to the project (recommended: `doc/reference/claude-sessions-details.md`)
 3. Copy `scripts/claude-session.py` to the project (recommended: `scripts/claude-session.py`)
 4. Add the CLAUDE.md integration snippet from `assets/template-claude-md-snippet.md` to the project's CLAUDE.md
-5. Customize the page tree structure in the index file to match the project's architecture
-6. Commit all files
+5. Create or update `.claude/settings.json` with the SessionStart hook (see `template-claude-md-snippet.md` for the exact JSON)
+6. Customize the page tree structure in the index file to match the project's architecture
+7. Run `python scripts/claude-session.py backup` once — this creates the sibling archive directory `<project-parent>/<project-name>-session-archives/` and captures any jsonl files already on disk
+8. Commit all files (the archive directory must NOT be added to git — it lives outside the repo)
 
-**Important:** The script requires Python 3.6+. On Windows, if Unicode errors occur, prefix with `PYTHONUTF8=1`.
+**Important notes:**
+
+- The script requires Python 3.6+. On Windows, if Unicode errors occur, prefix with `PYTHONUTF8=1`.
+- The archive directory is intentionally placed **outside** the project repo so it isn't accidentally pushed to GitHub (chat logs may be sensitive, plus single jsonl files can exceed GitHub's 100MB limit).
+- Do NOT `git init` inside the archive directory. jsonl is append-only — the latest version always contains the entire history, so version control adds no value, and would just waste disk and risk accidental pushes.
+
+## Migrate
+
+Bring an already-initialized project up to the latest skill version (e.g., when this skill ships new features like the backup/restore mechanism).
+
+**Trigger:** User says something like "sync this project to the latest session-manager skill" or "this project's claude-session.py is out of date".
+
+**Steps:**
+
+1. **Read** the project's existing `scripts/claude-session.py` and CLAUDE.md "Session Expert Management" section — understand what's there before overwriting
+2. **Replace** the project's `scripts/claude-session.py` with the latest version from `<skill-root>/scripts/claude-session.py`. If the project translated the script to a different language (e.g., Chinese comments), preserve that style by porting only the new functions/messages
+3. **Update** the project's CLAUDE.md "Session Expert Management" section using `assets/template-claude-md-snippet.md` as the reference. Preserve any project-specific customizations (e.g., custom file paths) but adopt the new structure (decision tree + command quick reference + troubleshooting table)
+4. **Add or update** `.claude/settings.json` with the SessionStart hook (merge with any existing hooks/permissions)
+5. **Run** `python scripts/claude-session.py backup` once to create the sibling archive directory and capture all currently surviving jsonl files
+6. **Verify** by tailing `<archive-dir>/backup.log` — should show a recent `backup done` line
+7. **Commit** the script + CLAUDE.md + settings.json changes (not the archive directory)
+8. **Do NOT touch** the project's `claude-sessions.md` / `claude-sessions-details.md` actual data — only adopt new template structure if needed (e.g., add "Permanently lost sessions" section if relevant)
+
+**What this preserves:** all existing session expert registrations, page tree, file path index, and details — Migrate only updates the *infrastructure*, not the project's accumulated data.
 
 ## Route
 
@@ -106,7 +137,7 @@ The session will compare its current context against its registered info and upd
 
 ## Activate
 
-Resume a session that has fallen out of Claude Code's ~10 most recent.
+Resume a session that has fallen out of Claude Code's ~10 most recent (but whose jsonl is still on disk).
 
 ```bash
 # Check which sessions are resumable
@@ -120,6 +151,44 @@ claude --resume <session-id>
 ```
 
 The script supports partial ID matching (e.g., `activate 3f5273` instead of the full UUID).
+
+## Restore
+
+Recover a session whose jsonl was purged by Claude Code (file no longer in `~/.claude/projects/<project>/`).
+
+```bash
+# Check status — purged sessions show 0B or are missing entirely
+python scripts/claude-session.py list
+
+# Restore from sibling-directory backup
+python scripts/claude-session.py restore <session-id>
+
+# Then bump timestamps and resume as usual
+python scripts/claude-session.py activate <session-id>
+claude --resume <session-id>
+```
+
+Bulk variant: `python scripts/claude-session.py restore --all` copies every backup whose source is currently missing (existing live files are not overwritten unless you pass `--force`).
+
+**How the backup directory gets populated:** A SessionStart hook runs `backup --quiet --async` automatically every time Claude Code starts. The backup is incremental, validated (line count must not decrease, last line must parse as JSON), and never deletes — even if Claude Code purges the source. See `assets/template-claude-md-snippet.md` for the full mechanism.
+
+## Backup
+
+Manually trigger an incremental backup (the SessionStart hook does this automatically — usually unnecessary).
+
+```bash
+# Synchronous, prints what was copied
+python scripts/claude-session.py backup
+
+# What the SessionStart hook runs (silent, returns immediately)
+python scripts/claude-session.py backup --quiet --async
+```
+
+**When to run manually:**
+
+- You just finished critical work and want to capture it before closing the session
+- You suspect the hook isn't firing — running this and checking `<archive-dir>/backup.log` will tell you
+- You're about to do something risky (e.g., delete jsonl files or run experiments) and want a known-good snapshot first
 
 ## Maintain
 
@@ -135,7 +204,13 @@ Guidelines for keeping session documentation healthy:
 
 ### scripts/
 
-- `claude-session.py` — Session management CLI tool (list sessions, activate expired ones). Copy to the target project's `scripts/` directory.
+- `claude-session.py` — Session management CLI tool. Subcommands:
+  - `list` — show all sessions for the current project, with resumable status
+  - `activate <id>` — bump timestamps so an old session re-enters the resumable top-10
+  - `backup [--quiet] [--async]` — incremental backup to the sibling archive directory
+  - `restore <id> [--force]` / `restore --all` — copy a backed-up jsonl back to `~/.claude/projects/<project>/`
+
+  Copy to the target project's `scripts/` directory.
 
 ### assets/
 
