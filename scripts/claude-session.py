@@ -15,6 +15,11 @@ Background:
   timestamps (to bring old sessions back into the resumable window) and
   maintains a sibling-directory backup so purged sessions can be restored.
 
+  Note: older Claude Code kept a sessions-index.json in the project storage dir;
+  newer versions do not (only <uuid>.jsonl files remain). This tool works with
+  both — when the index is absent, list/activate derive everything from the
+  .jsonl files directly. backup/restore never needed the index.
+
 Usage:
   python scripts/claude-session.py list
   python scripts/claude-session.py activate <session-id>
@@ -76,12 +81,22 @@ def find_session_index_file():
     return None
 
 
+def has_sessions_index(project_dir):
+    """Whether the legacy sessions-index.json exists.
+
+    Older Claude Code maintained this file; newer versions do not (they keep
+    only <uuid>.jsonl files). When absent, list/activate derive everything from
+    the .jsonl files on disk instead.
+    """
+    return (project_dir / "sessions-index.json").exists()
+
+
 def load_sessions_index(project_dir):
-    """Load sessions-index.json."""
+    """Load sessions-index.json. Returns {"entries": []} when it doesn't exist
+    (newer Claude Code has no index file → sessions are derived from .jsonl)."""
     index_path = project_dir / "sessions-index.json"
     if not index_path.exists():
-        print(f"Error: cannot find {index_path}")
-        sys.exit(1)
+        return {"entries": []}
     with open(index_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -253,12 +268,19 @@ def cmd_list():
     print(f"Project storage: {project_dir}")
     print()
 
+    if not project_dir.exists():
+        print(f"Project storage path does not exist: {project_dir}")
+        sys.exit(1)
+
+    has_index = has_sessions_index(project_dir)
     index_data = load_sessions_index(project_dir)
     entries = index_data.get("entries", [])
 
-    # Get the mtime of sessions-index.json itself (used to distinguish stale vs active mtime mismatches)
-    index_file_path = project_dir / "sessions-index.json"
-    index_file_mtime = int(index_file_path.stat().st_mtime * 1000)
+    # Get the mtime of sessions-index.json itself (used to distinguish stale vs active mtime mismatches).
+    # Newer Claude Code has no index → 0 (stale detection is skipped in that mode).
+    index_file_mtime = 0
+    if has_index:
+        index_file_mtime = int((project_dir / "sessions-index.json").stat().st_mtime * 1000)
 
     # Load session expert mapping
     experts = load_session_experts()
@@ -317,17 +339,19 @@ def cmd_list():
             sid = f.stem
             real_ts = real_timestamps.get(sid, "")
             forked = is_forked_session(f)
+            # No legacy index → jsonl IS the source of truth ("diskonly", ranked normally);
+            # legacy index present but this file missing from it → genuine "orphan".
             sessions.append({
                 "id": sid,
                 "real_ts": real_ts,
                 "index_modified": "",
-                "msgs": 0,  # Skip full parse to keep list fast
+                "msgs": count_jsonl_lines(f) if not has_index else 0,
                 "summary": "",
                 "custom_title": "",
                 "file_size": f.stat().st_size,
                 "expert": experts.get(sid, ""),
                 "forked": forked,
-                "mtime_status": "orphan",  # File on disk but missing from index
+                "mtime_status": "diskonly" if not has_index else "orphan",
             })
             orphan_count += 1
 
@@ -336,7 +360,10 @@ def cmd_list():
 
     # Display
     total_indexed = len(entries)
-    print(f"Total {len(sessions)} sessions (indexed {total_indexed} + unindexed {orphan_count}, top {RESUMABLE_LIMIT} resumable)")
+    if has_index:
+        print(f"Total {len(sessions)} sessions (indexed {total_indexed} + unindexed {orphan_count}, top {RESUMABLE_LIMIT} resumable)")
+    else:
+        print(f"Total {len(sessions)} sessions (from .jsonl on disk; newer Claude Code has no index file; top {RESUMABLE_LIMIT} resumable)")
     print("=" * 110)
 
     fork_count = 0
@@ -385,6 +412,7 @@ def cmd_list():
 
 def cmd_activate(target_id):
     project_dir = get_project_storage_dir()
+    has_index = has_sessions_index(project_dir)
     index_data = load_sessions_index(project_dir)
     entries = index_data.get("entries", [])
 
@@ -410,14 +438,18 @@ def cmd_activate(target_id):
             print("Please provide a more specific ID")
             sys.exit(1)
 
-        # Build index entry from .jsonl file and register it
+        # Build an entry from the .jsonl file. Only persist it to a legacy index
+        # when one exists; newer Claude Code has no index → just use it in-memory.
         jsonl_file = disk_matches[0]
         print(f"Not found in index, but exists on disk: {jsonl_file.name}")
-        print("Building index entry from chat log...")
+        print("Building entry from chat log...")
         new_entry = build_index_entry_from_jsonl(jsonl_file)
-        index_data["entries"].append(new_entry)
-        save_sessions_index(project_dir, index_data)
-        print(f"  Registered in sessions-index.json ({new_entry['messageCount']} messages)")
+        if has_index:
+            index_data["entries"].append(new_entry)
+            save_sessions_index(project_dir, index_data)
+            print(f"  Registered in sessions-index.json ({new_entry['messageCount']} messages)")
+        else:
+            print(f"  Derived from .jsonl ({new_entry['messageCount']} messages; no index file to update)")
         print()
         matches = [new_entry]
 
@@ -516,20 +548,23 @@ def cmd_activate(target_id):
     # Read actual file mtime after writing (Claude Code validates this)
     actual_mtime = int(jsonl_path.stat().st_mtime * 1000)
 
-    # ── Step 2: Update sessions-index.json ──
-    print()
-    print("Step 2: Updating index file...")
-    for e in index_data["entries"]:
-        if e["sessionId"] == sid:
-            old_modified = e.get("modified", "N/A")
-            e["modified"] = now_iso
-            e["fileMtime"] = actual_mtime
-            print(f"  modified: {old_modified} -> {now_iso}")
-            print(f"  fileMtime: {actual_mtime}")
-            break
-
-    save_sessions_index(project_dir, index_data)
-    print(f"  sessions-index.json updated")
+    # ── Step 2: Update sessions-index.json (legacy only; newer Claude Code has none) ──
+    if has_index:
+        print()
+        print("Step 2: Updating index file...")
+        for e in index_data["entries"]:
+            if e["sessionId"] == sid:
+                old_modified = e.get("modified", "N/A")
+                e["modified"] = now_iso
+                e["fileMtime"] = actual_mtime
+                print(f"  modified: {old_modified} -> {now_iso}")
+                print(f"  fileMtime: {actual_mtime}")
+                break
+        save_sessions_index(project_dir, index_data)
+        print(f"  sessions-index.json updated")
+    else:
+        print()
+        print("Step 2: skipped (no legacy index; jsonl timestamp bump above is what makes it resumable)")
 
     # ── Done ──
     print()
